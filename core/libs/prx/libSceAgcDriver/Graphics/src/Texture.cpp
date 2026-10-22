@@ -213,6 +213,11 @@ bool BlockTrackingEnabled() {
     return !disabled;
 }
 
+bool WholeSurfaceShadow() {
+    static const bool disabled = std::getenv("APS5_NO_WHOLE_SURFACE_SHADOW") != nullptr;
+    return !disabled && UnitShadowEnabled();
+}
+
 struct PhaseTimer {
     std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     double lap() {
@@ -2725,8 +2730,19 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
             return;
         }
-        // Units another image's results shadow reach the import before the detile reads it in place.
-        PublishShadow(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), PublishScope::Whole, PublishReason::Upload);
+        const bool gather = WholeSurfaceShadow() && AnyShadowedOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+        std::vector<ShadowRun> gathered;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> gatheredReads;
+        if (gather) {
+            const auto runs = layers != nullptr ? unitRuns(*layers) : std::vector<std::pair<std::uint64_t, std::uint64_t>>{{0, guestBytes}};
+            gathered = ShadowSources(context, *import, descriptor.baseAddress, runs, {});
+            for (const auto& source : gathered) {
+                if (!source.shadow) gatheredReads.emplace_back(descriptor.baseAddress + source.begin, descriptor.baseAddress + source.end);
+            }
+        } else {
+            PublishShadow(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), PublishScope::Whole, PublishReason::Upload);
+        }
+        auto gatheredBytes = gather ? std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT) : nullptr;
         forgetBorrowed(0, trackedLayers);
         std::uint64_t uploadedBytes = layers == nullptr ? guestBytes : 0;
         if (layers != nullptr) {
@@ -2743,25 +2759,44 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         auto timing = Recorder::NoTiming;
         if (recorder != nullptr) {
             // A queued label store in the surface lands before the detile reads it.
-            recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            if (gather) {
+                for (const auto& [begin, end] : gatheredReads) recorder->FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
+            } else {
+                recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            }
             commands = recorder->Commands();
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
             if (linear) recorder->Keep(linear, linear->Size());
+            if (gatheredBytes) recorder->Keep(gatheredBytes, gatheredBytes->Size());
+            for (const auto& source : gathered) {
+                if (source.slab != nullptr) recorder->Keep(source.slab);
+            }
             // The image itself must outlive the recorded copy: the cache may evict it right after.
             if (auto self = weak_from_this().lock()) keepStorageTexture(*recorder, std::move(self));
             // The detile reads the tiled bytes from the import when the batch runs.
-            recorder->NotePendingRead(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), Recorder::ReadKind::StorageUpload);
+            if (!gather) recorder->NotePendingRead(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), Recorder::ReadKind::StorageUpload);
+            else if (!gatheredReads.empty()) recorder->NotePendingReads(gatheredReads, Recorder::ReadKind::StorageUpload);
             Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, direct ? 2 : 3);
             if (Recorder::BarrierValidate()) {
                 const std::pair<std::uint64_t, std::uint64_t> read{descriptor.baseAddress, descriptor.baseAddress + guestBytes};
                 const std::pair<VkImage, bool> written{image, true};
-                recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{std::span(&read, 1), {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
+                const auto reads = gather ? std::span<const std::pair<std::uint64_t, std::uint64_t>>(gatheredReads) : std::span<const std::pair<std::uint64_t, std::uint64_t>>(&read, 1);
+                recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{reads, {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
             }
         } else {
             batch = std::make_unique<CommandBatch>(context);
             commands = batch->Handle();
         }
-        const auto importOffset = HostImportOffset(*import, descriptor.baseAddress);
+        const auto importOffset = gather ? 0 : HostImportOffset(*import, descriptor.baseAddress);
+        const auto sourceBuffer = gather ? gatheredBytes->Handle() : import->buffer;
+        if (gather) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+            for (const auto& source : gathered) {
+                const VkBufferCopy copy{source.offset, source.begin, source.end - source.begin};
+                copyBuffer(commands, source.buffer, gatheredBytes->Handle(), 1, &copy);
+            }
+        }
         if (direct) {
             recordDirectUploadBarrier(commands, layers == nullptr);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
@@ -2769,7 +2804,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 for (std::uint32_t level = 0; level < mips.size(); ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
-                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
+                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, sourceBuffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
                 }
             }
             recordDirectUploadDone(commands);
@@ -2788,7 +2823,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             for (std::uint32_t level = 0; level < mips.size(); ++level) {
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto& mip = mips[level];
-                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, sourceBuffer, importOffset + geometry.GuestLayerOffset(layer) + mip.tiledOffset, linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
             }
         }
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -3294,6 +3329,54 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     return uploadedBytes;
 }
 
+namespace {
+
+struct RetileRouting {
+    struct SlabPieces {
+        std::shared_ptr<ShadowSlab> slab;
+        std::shared_ptr<ShadowSlabPin> pin;
+        std::vector<VkBufferCopy> copies;
+    };
+    struct SeedUnit {
+        std::uint64_t begin;
+        std::uint64_t end;
+        std::shared_ptr<ShadowSlab> slab;
+        const HostImport* import;
+    };
+    struct Piece {
+        std::uint64_t end;
+        bool slab;
+        bool seeded;
+    };
+
+    explicit RetileRouting(std::size_t segments) : importCopies(segments) {}
+
+    Piece route(const Context& context, std::size_t segment, const HostImport& import, std::uint64_t scratchOffset, std::uint64_t begin, std::uint64_t end, bool split, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported) {
+        const auto pieceEnd = split ? std::min(end, SlabBoundary(import, begin)) : end;
+        const auto destination = split ? ShadowDestinationFor(context, import, begin, pieceEnd) : std::nullopt;
+        if (!destination.has_value()) {
+            importCopies[segment].push_back({scratchOffset, HostImportOffset(import, begin), pieceEnd - begin});
+            if (!imported.empty() && imported.back().second == begin) imported.back().second = pieceEnd;
+            else imported.emplace_back(begin, pieceEnd);
+            return {pieceEnd, false, false};
+        }
+        if (slabPieces.empty() || slabPieces.back().slab != destination->slab) slabPieces.push_back({destination->slab, destination->pin, {}});
+        slabPieces.back().copies.push_back({scratchOffset, destination->offset, pieceEnd - begin});
+        for (const auto& [seedBegin, seedEnd] : destination->seedUnits) {
+            if (std::none_of(seeds.begin(), seeds.end(), [&](const SeedUnit& seed) { return seed.begin == seedBegin; })) seeds.push_back({seedBegin, seedEnd, destination->slab, &import});
+        }
+        if (!shadowed.empty() && shadowed.back().end == begin && shadowed.back().slab == destination->slab) shadowed.back().end = pieceEnd;
+        else shadowed.push_back({begin, pieceEnd, destination->slab});
+        return {pieceEnd, true, !destination->seedUnits.empty()};
+    }
+
+    std::vector<SlabPieces> slabPieces;
+    std::vector<SeedUnit> seeds;
+    std::vector<std::vector<VkBufferCopy>> importCopies;
+};
+
+}
+
 std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, Buffer* save) {
     const auto elementBytes = BytesPerElement(descriptor.format);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
@@ -3331,20 +3414,12 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     // import first), else the import as before. Decided before anything is recorded: making a
     // slab may evict another with a publish of its own (a chosen slab stays pinned by its
     // destination until the pieces are marked, so no later choice evicts it).
-    struct SlabPieces {
-        std::shared_ptr<ShadowSlab> slab;
-        std::shared_ptr<ShadowSlabPin> pin;
-        std::vector<VkBufferCopy> copies;
-    };
-    struct SeedUnit {
-        std::uint64_t begin;
-        std::uint64_t end;
-        std::shared_ptr<ShadowSlab> slab;
-        const HostImport* import;
-    };
-    std::vector<SlabPieces> slabPieces;
-    std::vector<std::vector<VkBufferCopy>> importCopies(segments.size());
-    std::vector<SeedUnit> seeds;
+    using SlabPieces = RetileRouting::SlabPieces;
+    using SeedUnit = RetileRouting::SeedUnit;
+    RetileRouting routing(segments.size());
+    auto& slabPieces = routing.slabPieces;
+    auto& seeds = routing.seeds;
+    auto& importCopies = routing.importCopies;
     struct AddedPiece {
         std::size_t pieces;
         std::size_t copy;
@@ -3359,27 +3434,11 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
             std::size_t segment = 0;
             while (segment + 1 < segments.size() && segments[segment + 1].begin <= guestBegin) ++segment;
             Require(segments[segment].begin <= guestBegin && guestBegin < segments[segment].end, "storage image write-back piece lies outside its import segments");
-            const auto& import = *segments[segment].import;
-            auto pieceEnd = std::min(guestEnd, segments[segment].end);
-            if (UnitShadowEnabled()) pieceEnd = std::min(pieceEnd, SlabBoundary(import, guestBegin));
-            const auto destination = ShadowDestinationFor(context, import, guestBegin, pieceEnd);
-            if (destination.has_value()) {
-                if (slabPieces.empty() || slabPieces.back().slab != destination->slab) slabPieces.push_back({destination->slab, destination->pin, {}});
-                slabPieces.back().copies.push_back({scratchOffset, destination->offset, pieceEnd - guestBegin});
-                for (const auto& [seedBegin, seedEnd] : destination->seedUnits) {
-                    if (std::none_of(seeds.begin(), seeds.end(), [&](const SeedUnit& seed) { return seed.begin == seedBegin; })) seeds.push_back({seedBegin, seedEnd, destination->slab, &import});
-                }
-                added.push_back({slabPieces.size() - 1, slabPieces.back().copies.size() - 1, guestBegin - descriptor.baseAddress, pieceEnd - descriptor.baseAddress, true, !destination->seedUnits.empty()});
-                if (!shadowed.empty() && shadowed.back().end == guestBegin && shadowed.back().slab == destination->slab) shadowed.back().end = pieceEnd;
-                else shadowed.push_back({guestBegin, pieceEnd, destination->slab});
-            } else {
-                added.push_back({0, 0, guestBegin - descriptor.baseAddress, pieceEnd - descriptor.baseAddress, false, false});
-                importCopies[segment].push_back({scratchOffset, HostImportOffset(import, guestBegin), pieceEnd - guestBegin});
-                if (!imported.empty() && imported.back().second == guestBegin) imported.back().second = pieceEnd;
-                else imported.emplace_back(guestBegin, pieceEnd);
-            }
-            scratchOffset += pieceEnd - guestBegin;
-            guestBegin = pieceEnd;
+            const auto piece = routing.route(context, segment, *segments[segment].import, scratchOffset, guestBegin, std::min(guestEnd, segments[segment].end), UnitShadowEnabled(), shadowed, imported);
+            if (piece.slab) added.push_back({slabPieces.size() - 1, slabPieces.back().copies.size() - 1, guestBegin - descriptor.baseAddress, piece.end - descriptor.baseAddress, true, piece.seeded});
+            else added.push_back({0, 0, guestBegin - descriptor.baseAddress, piece.end - descriptor.baseAddress, false, false});
+            scratchOffset += piece.end - guestBegin;
+            guestBegin = piece.end;
         }
     };
     struct SlabRetile {
@@ -5627,10 +5686,22 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             ++Profile().storageDirectWriteBacks;
             return;
         }
+        RetileRouting routing(segments.size());
+        const auto& slabPieces = routing.slabPieces;
+        const auto& seeds = routing.seeds;
+        const auto& importCopies = routing.importCopies;
+        const bool route = WholeSurfaceShadow();
+        for (std::size_t segment = 0; segment < segments.size(); ++segment) {
+            for (const auto& [from, to] : keep) {
+                auto begin = std::max(from, segments[segment].begin);
+                const auto end = std::min(to, segments[segment].end);
+                while (begin < end) begin = routing.route(context, segment, *segments[segment].import, begin - descriptor.baseAddress, begin, end, route, shadowed, imported).end;
+            }
+        }
         // The whole-layer copies below overwrite the interior units of the span; the edge units
         // keep a neighbour's shadowed results in the rest of their bytes, which reach the import
         // first (this write-back's stamps then make those units stale).
-        PublishShadow(firstStored, static_cast<std::size_t>(lastStored - firstStored), PublishScope::PartialUnits, PublishReason::Upload);
+        for (const auto& [begin, end] : imported) PublishShadow(begin, static_cast<std::size_t>(end - begin), PublishScope::PartialUnits, PublishReason::Upload);
         // The surface lives in host-imported memory: the retiler writes into device scratch and the
         // untouched blocks are copied into the imported bytes in place, recorded behind the work that
         // produced the image; nothing crosses to the CPU.
@@ -5654,6 +5725,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (linear) recorder->Keep(linear, linear->Size());
             recorder->Keep(tiledScratch, tiledScratch->Size());
             for (const auto& slab : padding.slabs) recorder->Keep(slab);
+            for (const auto& pieces : slabPieces) recorder->Keep(pieces.slab);
             // The image itself must outlive the recorded retile: the cache may evict it right after.
             if (auto self = weak_from_this().lock()) keepStorageTexture(*recorder, std::move(self));
             Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, padding.copies.empty() ? 4 : 5);
@@ -5685,6 +5757,14 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             for (const auto& [source, copies] : padding.copies) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, source, tiledScratch->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
         }
+        if (!seeds.empty()) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            for (const auto& [begin, end, slab, import] : seeds) {
+                const VkBufferCopy seed{HostImportOffset(*import, begin), SlabOffset(*import, *slab, begin), end - begin};
+                context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, import->buffer, slab->buffer, 1, &seed);
+                NoteShadowSeed(begin, end);
+            }
+        }
         const auto regions = CopyRegions(storedLayers);
         context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
@@ -5699,16 +5779,11 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             }
         }
         {
-            const auto scratchDone = WholeBufferBarrier(tiledScratch->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &scratchDone, 0, nullptr);
-            for (const auto& segment : segments) {
-                std::vector<VkBufferCopy> copies;
-                for (const auto& [from, to] : keep) {
-                    const auto begin = std::max(from, segment.begin);
-                    const auto end = std::min(to, segment.end);
-                    if (begin < end) copies.push_back({begin - descriptor.baseAddress, HostImportOffset(*segment.import, begin), end - begin});
-                }
-                if (!copies.empty()) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiledScratch->Handle(), segment.import->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
+            const VkMemoryBarrier scratchDone{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &scratchDone, 0, nullptr, 0, nullptr);
+            for (const auto& pieces : slabPieces) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiledScratch->Handle(), pieces.slab->buffer, static_cast<std::uint32_t>(pieces.copies.size()), pieces.copies.data());
+            for (std::size_t segment = 0; segment < segments.size(); ++segment) {
+                if (!importCopies[segment].empty()) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiledScratch->Handle(), segments[segment].import->buffer, static_cast<std::uint32_t>(importCopies[segment].size()), importCopies[segment].data());
             }
             if (!saveUnits.empty()) {
                 std::vector<VkBufferCopy> saves;
@@ -5728,7 +5803,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
             recorder->MarkShaderReadsCovered();
-            recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            if (slabPieces.empty()) recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            else if (!imported.empty()) recorder->NotePendingWrites(imported);
         }
         countStorageWriteBack(storedBytes, true);
         if (profile) Profile().storageGpu += timer.lap();
