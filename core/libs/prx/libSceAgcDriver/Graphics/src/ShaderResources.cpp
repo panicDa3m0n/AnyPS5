@@ -1030,8 +1030,11 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
     return cache.entries.end();
 }
 
+std::atomic<std::uint64_t> storageCacheSerial{1};
+
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+    storageCacheSerial.fetch_add(1, std::memory_order_relaxed);
     auto texture = it->texture;
     it->texture->SetCached(false);
     noteUncached(it->texture);
@@ -1179,6 +1182,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             cache.entries.push_front(std::move(entry));
             cache.index[key] = cache.entries.begin();
             cache.byImage[texture.get()] = cache.entries.begin();
+            storageCacheSerial.fetch_add(1, std::memory_order_relaxed);
             texture->SetCached(true);
             counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
@@ -1444,6 +1448,10 @@ std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, con
 
 std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, const GuestTextureResource& resource, std::uint32_t firstLayer, std::uint32_t layerCount) {
     return cachedStorageTexture(context, {}, resource, 0, 0, false, std::pair{firstLayer, layerCount});
+}
+
+std::uint64_t StorageCacheSerial() {
+    return storageCacheSerial.load(std::memory_order_relaxed);
 }
 
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress) {
@@ -3243,7 +3251,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
-bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+bool PendingCpuWritesOverlap(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || Recorder::InCompletion()) return false;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr) return false;
@@ -3254,12 +3262,14 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     const auto overlaps = [&](const auto& writers) {
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->CopiedWritesOverlap(address, bytes); });
     };
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
-        Recorder::CountSync(4);
-        recorder->SyncThrough(address, bytes);
-        return true;
-    }
-    return false;
+    return (context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes));
+}
+
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes) {
+    if (!PendingCpuWritesOverlap(context, address, bytes)) return false;
+    Recorder::CountSync(4);
+    Recorder::Active()->SyncThrough(address, bytes);
+    return true;
 }
 
 const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::span<const CompiledShader> shaders, ShaderRecompiler::ShaderStage stage) {

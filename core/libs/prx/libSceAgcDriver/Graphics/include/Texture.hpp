@@ -376,6 +376,7 @@ public:
     static std::uint64_t ClearHandOvers();
     static std::uint64_t HandedOverSuperseded();
     static void SetClearHandOver(bool enabled);
+    static std::uint64_t RefreshesChanged();
     static std::uint64_t UntrackedCompares();
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
